@@ -3,15 +3,15 @@ from collections import defaultdict
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 
-# 60 days in seconds
-DEFAULT_BIN_SIZE_SECONDS = 60 * 24 * 3600
+# ~6 months in seconds (matches C++ default 6*30 days)
+DEFAULT_BIN_SIZE_SECONDS = 6 * 30 * 24 * 3600
 
 
 @dataclass
@@ -190,6 +190,34 @@ class DynamicPoissonFactorization(nn.Module):
         lam = (theta * beta).sum(dim=-1)  # (nnz,)
         return lam.clamp_min(eps)
 
+    def total_expected_rate(self, max_time: Optional[int] = None) -> torch.Tensor:
+        """
+        Compute sum_{n,m,t} E[lambda_{nmt}] up to max_time (exclusive).
+        This adds back the Poisson penalty for all zero entries.
+        """
+        if max_time is None:
+            max_time = self.T
+
+        # Expected exp(user log-factor) for all users/items at each time.
+        mu_u_total = self.mu_u[:, :, :max_time] + self.mu_u_bar[:, :, None]  # (N,K,T)
+        var_u_total = (
+            torch.exp(self.logvar_u[:, :, :max_time])
+            + torch.exp(self.logvar_u_bar)[:, :, None]
+        )
+        theta = torch.exp(mu_u_total + 0.5 * var_u_total)  # (N,K,T)
+
+        mu_v_total = self.mu_v[:, :, :max_time] + self.mu_v_bar[:, :, None]  # (M,K,T)
+        var_v_total = (
+            torch.exp(self.logvar_v[:, :, :max_time])
+            + torch.exp(self.logvar_v_bar)[:, :, None]
+        )
+        beta = torch.exp(mu_v_total + 0.5 * var_v_total)  # (M,K,T)
+
+        # Sum over users/items, then over factors and time.
+        theta_sum = theta.sum(dim=0)  # (K,T)
+        beta_sum = beta.sum(dim=0)  # (K,T)
+        return (theta_sum * beta_sum).sum()
+
     def expected_log_likelihood(self, interactions: Interactions) -> torch.Tensor:
         """
         phi-based lower bound on E_q[log p(Y | Z)] as in dPF:
@@ -211,9 +239,6 @@ class DynamicPoissonFactorization(nn.Module):
         time_ids = interactions.time_ids.to(self.device).long()
         y = interactions.counts.to(self.device)
 
-        # E[lam_{nmt}] = sum_k E[theta_{nkt} beta_{mkt}]
-        lam = self.poisson_rate(user_ids, item_ids, time_ids)  # (nnz,) # type:ignore
-
         # E[log theta_{nkt}] and E[log beta_{mkt}] (log of lognormal is just its mean)
         log_theta = self.expected_log_user_factors(
             user_ids,  # type:ignore
@@ -227,8 +252,17 @@ class DynamicPoissonFactorization(nn.Module):
         # This is log sum_k exp(E[log theta] + E[log beta]) for each (n,m,t)
         log_lam_tilde = torch.logsumexp(log_theta + log_beta, dim=-1)  # (nnz,)
 
-        # phi-optimized lower bound: y * log_lam_tilde - E[lam] - log(y!)
-        log_lik = (y * log_lam_tilde - lam - torch.lgamma(y + 1.0)).sum()
+        # Poisson log-likelihood over all entries:
+        #   sum_{obs} y log lam - log(y!)  - sum_{all} E[lam]
+        # The global -E[lam] term penalizes unobserved cells too.
+        y_log_term = (y * log_lam_tilde - torch.lgamma(y + 1.0)).sum()
+
+        # Restrict penalty to timesteps present in this split to mirror C++,
+        # which only runs up to the last train timestep.
+        max_time = int(interactions.time_ids.max().item()) + 1
+        total_rate = self.total_expected_rate(max_time=max_time)
+
+        log_lik = y_log_term - total_rate
         return log_lik
 
     def responsibilities_phi(
@@ -402,19 +436,55 @@ class DynamicPoissonFactorization(nn.Module):
 def train_dpf(
     model: DynamicPoissonFactorization,
     train_int: Interactions,
-    num_epochs: int = 100,
+    val_int: Optional[Interactions] = None,
+    num_epochs: int = 1000,
     lr: float = 1e-2,
     optimizer_name: str = "lbfgs",
+    report_every: int = 10,
+    min_epochs_before_stop: int = 30,
     verbose: bool = True,
 ) -> None:
     """
-    Simple full-batch training loop on 'train_int'.
+    Full-batch training loop on 'train_int' with optional validation-based early stopping
+    (mirrors the C++ schedule: report every 10 iters, stop on flat/decreasing val pred LL).
 
     - optimizer_name: "adamw" or "lbfgs"
     - full dataset is used per step (possible to add mini-batching?).
+    - if val_int is provided, predictive LL is computed every report_every steps and
+      stopping triggers after min_epochs_before_stop once the metric stagnates/degrades.
     """
     model.train()
     params = list(model.parameters())
+
+    device = model.device
+
+    # Per-user last train time for clamping validation/test (mirrors C++ usage).
+    last_train_time_cpu = last_training_timestep(train_int, model.N)
+    last_train_time = torch.from_numpy(last_train_time_cpu).to(device)
+
+    def predictive_log_likelihood(intx: Interactions) -> float:
+        """
+        Predictive log-likelihood over provided entries only
+        (no all-zero penalty), clamping timesteps to last train
+        per-user as in C++.
+        """
+        if intx.user_ids.numel() == 0:
+            return 0.0
+
+        user_ids = intx.user_ids.to(device).long()
+        item_ids = intx.item_ids.to(device).long()
+        time_ids_orig = intx.time_ids.to(device).long()
+        # clamp to last observed train timestep for each user
+        time_ids = torch.minimum(time_ids_orig, last_train_time[user_ids])
+
+        y = intx.counts.to(device)
+        lam = model.poisson_rate(user_ids, item_ids, time_ids)  # type:ignore
+        ll = (y * torch.log(lam) - lam - torch.lgamma(y + 1.0)).sum()
+        return float(ll.detach().cpu().item())
+
+    prev_val_ll: Optional[float] = None
+    nh = 0  # number of consecutive decreases
+    stop = False
 
     optimizer_name = optimizer_name.lower()
     if optimizer_name == "adamw":
@@ -427,8 +497,34 @@ def train_dpf(
             loss.backward()
             optimizer.step()
 
-            if verbose and (epoch % 10 == 0 or epoch == num_epochs - 1):
-                print(f"[AdamW] epoch={epoch:03d}  ELBO={elbo.item():.3e}")
+            should_report = verbose and (
+                epoch % report_every == 0 or epoch == num_epochs - 1
+            )
+            if should_report:
+                msg = f"[AdamW] epoch={epoch:04d}  ELBO={elbo.item():.3e}"
+                if val_int is not None and epoch % report_every == 0:
+                    val_ll = predictive_log_likelihood(val_int)
+                    msg += f"  val_pred_ll={val_ll:.3e}"
+                    if epoch >= min_epochs_before_stop:
+                        if prev_val_ll is not None:
+                            if (
+                                val_ll > prev_val_ll
+                                and prev_val_ll != 0
+                                and abs((val_ll - prev_val_ll) / prev_val_ll) < 1e-6
+                            ):
+                                stop = True
+                            elif val_ll < prev_val_ll:
+                                nh += 1
+                            else:
+                                nh = 0
+                            if nh > 2:
+                                stop = True
+                        prev_val_ll = val_ll
+                print(msg)
+            if stop:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch}")
+                break
 
     elif optimizer_name == "lbfgs":
         optimizer = torch.optim.LBFGS(
@@ -450,12 +546,36 @@ def train_dpf(
 
             loss = optimizer.step(closure)
 
-            if verbose and (epoch % 1 == 0 or epoch == num_epochs - 1):
+            should_report = verbose and (
+                epoch % report_every == 0 or epoch == num_epochs - 1
+            )
+            if should_report:
                 with torch.no_grad():
                     elbo = model.elbo(train_int)
-                print(
-                    f"[LBFGS] epoch={epoch:03d}  loss={loss.item():.3e}  ELBO={elbo.item():.3e}"
-                )
+                msg = f"[LBFGS] epoch={epoch:04d}  loss={loss.item():.3e}  ELBO={elbo.item():.3e}"
+                if val_int is not None and epoch % report_every == 0:
+                    val_ll = predictive_log_likelihood(val_int)
+                    msg += f"  val_pred_ll={val_ll:.3e}"
+                    if epoch >= min_epochs_before_stop:
+                        if prev_val_ll is not None:
+                            if (
+                                val_ll > prev_val_ll
+                                and prev_val_ll != 0
+                                and abs((val_ll - prev_val_ll) / prev_val_ll) < 1e-6
+                            ):
+                                stop = True
+                            elif val_ll < prev_val_ll:
+                                nh += 1
+                            else:
+                                nh = 0
+                            if nh > 2:
+                                stop = True
+                        prev_val_ll = val_ll
+                print(msg)
+            if stop:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch}")
+                break
     else:
         raise ValueError(f"Unknown optimizer_name={optimizer_name}")
 
@@ -476,6 +596,21 @@ def build_user_time_positives(
         if c > 0:
             ut_pos[(int(u), int(t))].add(int(i))
     return ut_pos
+
+
+def last_training_timestep(train_int: Interactions, num_users: int) -> np.ndarray:
+    """
+    For each user, return the last time bin (inclusive) seen in training.
+    """
+    last_t = np.zeros(num_users, dtype=np.int64)
+    if train_int.user_ids.numel() == 0:
+        return last_t
+    users = train_int.user_ids.cpu().numpy()
+    times = train_int.time_ids.cpu().numpy()
+    for u, t in zip(users, times):
+        if t > last_t[u]:
+            last_t[u] = t
+    return last_t
 
 
 def scores_for_user_time(
@@ -508,8 +643,12 @@ def recall_ndcg_at_k(
     test_users: Optional[np.ndarray] = None,
 ) -> tuple[float, float]:
     """
-    Evaluate Recall@K and NDCG@K over all (user, time_bin) pairs
+    Evaluate Recall@k and NDCG@k over all (user, time_bin) pairs
     that have at least one positive item.
+
+    Here:
+      - k is the top-T cutoff over items (T in the paper).
+      - The number of latent factors is model.K (unrelated).
 
     If test_users is provided (1D np.array of user IDs), restrict to those users.
     """
@@ -532,11 +671,13 @@ def recall_ndcg_at_k(
         hits = [1.0 if item in pos_items else 0.0 for item in topk]
         num_pos = len(pos_items)
 
-        # Recall@K
-        recall = sum(hits) / num_pos
+        # --- Recall@k: paper uses denominator min(k, |y_i|)
+        recall = sum(hits) / float(min(k, num_pos))
         recalls.append(recall)
 
-        # NDCG@K
+        # --- NDCG@k: standard normalized truncated NDCG (this is NOT exactly
+        # the paper's NDCG, which is unnormalized and not truncated, but it's
+        # a perfectly reasonable top-k metric to keep).
         dcg = sum(h / math.log2(i + 2) for i, h in enumerate(hits))
         ideal_hits = [1.0] * min(num_pos, k)
         idcg = sum(h / math.log2(i + 2) for i, h in enumerate(ideal_hits))
@@ -547,6 +688,294 @@ def recall_ndcg_at_k(
         return 0.0, 0.0
 
     return float(np.mean(recalls)), float(np.mean(ndcgs))
+
+
+def precision_ndcg_at_ks(
+    model: DynamicPoissonFactorization,
+    train_int: Interactions,
+    val_int: Interactions,
+    test_int: Interactions,
+    ks: tuple[int, ...] = (10, 100),
+    test_users: Optional[np.ndarray] = None,
+) -> dict[int, tuple[float, float]]:
+    """
+    Mimic the C++ compute_precision:
+      - rank items at each user's last train timestep
+      - exclude any item appearing in train or validation (any time)
+      - relevance from test counts at time >= last-train timestep (graded)
+      - report precision@k and ndcg@k for requested ks
+    Returns {k: (precision_at_k, ndcg_at_k)}.
+    """
+    import numpy as np
+
+    device = model.device
+    max_k = max(ks)
+
+    # Last train timestep per user
+    last_t = last_training_timestep(train_int, model.N)
+
+    # Items seen in train/validation per user (exclude from ranking)
+    def gather_seen(intx: Interactions) -> dict[int, set[int]]:
+        seen: dict[int, set[int]] = defaultdict(set)
+        if intx.user_ids.numel() == 0:
+            return seen
+        for u, m in zip(intx.user_ids.cpu().numpy(), intx.item_ids.cpu().numpy()):
+            seen[int(u)].add(int(m))
+        return seen
+
+    train_seen = gather_seen(train_int)
+    val_seen = gather_seen(val_int)
+
+    # Test entries per user (item, time, count)
+    test_by_user: dict[int, list[tuple[int, int, float]]] = defaultdict(list)
+    for u, m, t, c in zip(
+        test_int.user_ids.cpu().numpy(),
+        test_int.item_ids.cpu().numpy(),
+        test_int.time_ids.cpu().numpy(),
+        test_int.counts.cpu().numpy(),
+    ):
+        test_by_user[int(u)].append((int(m), int(t), float(c)))
+
+    users_to_eval: Iterable[int]
+    if test_users is not None:
+        users_to_eval = [int(u) for u in test_users.tolist()]
+    else:
+        users_to_eval = list(test_by_user.keys())
+
+    precisions = {k: [] for k in ks}
+    ndcgs = {k: [] for k in ks}
+
+    # Safe gain to avoid overflow in (2^g - 1)
+    ln2 = math.log(2.0)
+
+    def _gain(x: float) -> float:
+        if x <= 0:
+            return 0.0
+        return math.expm1(min(x * ln2, 700.0))  # clamp exponent to avoid inf
+
+    for u in users_to_eval:
+        if u >= model.N:
+            continue
+        t_last = int(last_t[u])
+        # Determine relevance: first test event at or after t_last
+        rel: dict[int, float] = {}
+        rel_time: dict[int, int] = {}
+        for m, t, c in test_by_user.get(u, []):
+            if t < t_last:
+                continue
+            if m not in rel_time or t < rel_time[m]:
+                rel_time[m] = t
+                rel[m] = c
+
+        # No relevant items => skip (matches C++ behavior of user_has_test_ratings)
+        if not rel:
+            continue
+
+        # Score all items at t_last
+        M = model.M
+        user_ids = torch.full((M,), u, dtype=torch.long, device=device)
+        item_ids = torch.arange(M, dtype=torch.long, device=device)
+        time_ids = torch.full(
+            (M,), min(t_last, model.T - 1), dtype=torch.long, device=device
+        )
+
+        with torch.no_grad():
+            scores = model.poisson_rate(user_ids, item_ids, time_ids)  # type:ignore
+
+        # Mask out train/val items
+        seen_items = train_seen.get(u, set()) | val_seen.get(u, set())
+        if seen_items:
+            mask = torch.full_like(scores, False, dtype=torch.bool)
+            if len(seen_items) > 0:
+                idx = torch.tensor(list(seen_items), dtype=torch.long, device=device)
+                mask[idx] = True
+            scores = scores.masked_fill(mask, -float("inf"))
+
+        # Top-k
+        topk = torch.topk(scores, max_k).indices.cpu().numpy().tolist()
+
+        # Build gains for sorted predictions
+        gains = [rel.get(m, 0.0) for m in topk]
+
+        # Ideal gains (sorted by relevance)
+        ideal = sorted(rel.values(), reverse=True)
+
+        for k in ks:
+            pred_k = gains[:k]
+            hits = sum(1.0 for g in pred_k if g > 0)
+            precisions[k].append(hits / k)
+
+            ideal_k = ideal[:k]
+            if ideal_k and ideal_k[0] > 0:
+                dcg = sum(_gain(g) / math.log2(i + 2) for i, g in enumerate(pred_k))
+                idcg = sum(_gain(g) / math.log2(i + 2) for i, g in enumerate(ideal_k))
+                ndcgs[k].append(dcg / idcg if idcg > 0 else 0.0)
+
+    return {
+        k: (
+            float(np.mean(precisions[k])) if precisions[k] else 0.0,
+            float(np.mean(ndcgs[k])) if ndcgs[k] else 0.0,
+        )
+        for k in ks
+    }
+
+
+def paper_ranking_metrics(
+    model: DynamicPoissonFactorization,
+    train_int: Interactions,
+    val_int: Interactions,
+    test_int: Interactions,
+    T: int = 50,
+    test_users: Optional[np.ndarray] = None,
+) -> dict[str, float]:
+    """
+    C++-aligned ranking metrics:
+      - rank items for each user at their last training timestep
+      - exclude any item seen in train or validation for that user
+      - only test events at or after that timestep are relevant
+      - rank is truncated to top-100 (items outside contribute 0 to MRR/NDCG and
+        get a rank of 101 for MAR)
+
+    Returns averages across evaluated users:
+      Recall@T  (hits within top-T divided by min(T, #relevant))
+      NDCG      normalized DCG@100 with gains 2^rel - 1 and natural log
+      MRR       sum of reciprocal ranks for items retrieved within top-100
+      MAR       sum of ranks for relevant items (rank=101 if not in top-100)
+    """
+    import numpy as np
+
+    device = model.device
+    max_k = 100
+    last_t = last_training_timestep(train_int, model.N)
+
+    def gather_seen(intx: Interactions) -> dict[int, set[int]]:
+        seen: dict[int, set[int]] = defaultdict(set)
+        if intx.user_ids.numel() == 0:
+            return seen
+        for u, m in zip(intx.user_ids.cpu().numpy(), intx.item_ids.cpu().numpy()):
+            seen[int(u)].add(int(m))
+        return seen
+
+    train_seen = gather_seen(train_int)
+    val_seen = gather_seen(val_int)
+
+    test_by_user: dict[int, list[tuple[int, int, float]]] = defaultdict(list)
+    for u, m, t, c in zip(
+        test_int.user_ids.cpu().numpy(),
+        test_int.item_ids.cpu().numpy(),
+        test_int.time_ids.cpu().numpy(),
+        test_int.counts.cpu().numpy(),
+    ):
+        test_by_user[int(u)].append((int(m), int(t), float(c)))
+
+    recall_sum = 0.0
+    ndcg_sum = 0.0
+    mrr_sum = 0.0
+    mar_sum = 0.0
+    n_effective = 0
+
+    ln2 = math.log(2.0)
+
+    def _gain(x: float) -> float:
+        if x <= 0:
+            return 0.0
+        return math.expm1(min(x * ln2, 700.0))  # clamp exponent to avoid inf
+
+    users_to_eval: Iterable[int]
+    if test_users is not None:
+        users_to_eval = [int(u) for u in test_users.tolist()]
+    else:
+        users_to_eval = list(test_by_user.keys())
+
+    for u in users_to_eval:
+        if u >= model.N:
+            continue
+        t_last = int(last_t[u])
+
+        # Keep earliest test event for each item at or after last train timestep
+        rel: dict[int, float] = {}
+        rel_time: dict[int, int] = {}
+        for m, t, c in test_by_user.get(u, []):
+            if t < t_last:
+                continue
+            if m not in rel_time or t < rel_time[m]:
+                rel_time[m] = t
+                rel[m] = c
+
+        if not rel:
+            continue
+
+        M = model.M
+        user_ids = torch.full((M,), u, dtype=torch.long, device=device)
+        item_ids = torch.arange(M, dtype=torch.long, device=device)
+        time_ids = torch.full(
+            (M,), min(t_last, model.T - 1), dtype=torch.long, device=device
+        )
+
+        with torch.no_grad():
+            scores = model.poisson_rate(user_ids, item_ids, time_ids)  # type:ignore
+
+        # Mask seen items (train + validation)
+        seen_items = train_seen.get(u, set()) | val_seen.get(u, set())
+        if seen_items:
+            mask = torch.full_like(scores, False, dtype=torch.bool)
+            idx = torch.tensor(list(seen_items), dtype=torch.long, device=device)
+            mask[idx] = True
+            scores = scores.masked_fill(mask, -float("inf"))
+
+        topk = torch.topk(scores, max_k).indices.cpu().numpy().tolist()
+        ranks_map = {m: rank + 1 for rank, m in enumerate(topk)}
+
+        pos_ranks = np.array(
+            [ranks_map.get(m, np.inf) for m in rel.keys()], dtype=np.float64
+        )
+        num_pos = len(rel)
+
+        # Recall@T with truncation: only top-T can be hits
+        hits = float(np.count_nonzero(pos_ranks <= T))
+        recall_i = hits / float(min(T, num_pos))
+
+        # Normalized DCG@100 with gains 2^rel - 1 and natural log
+        dcg = 0.0
+        for m, rank in ranks_map.items():
+            if rank > max_k:
+                continue
+            g = rel.get(m, 0.0)
+            if g <= 0:
+                continue
+            dcg += _gain(g) / math.log(rank + 1.0)
+        ideal = sorted((_gain(v) for v in rel.values() if v > 0), reverse=True)[:max_k]
+        idcg = sum(g / math.log(i + 2.0) for i, g in enumerate(ideal))
+        ndcg_i = dcg / idcg if idcg > 0 else 0.0
+
+        # MRR: sum of reciprocal ranks for retrieved positives (only if in top-100)
+        finite_ranks = pos_ranks[np.isfinite(pos_ranks)]
+        mrr_i = float(np.sum(1.0 / finite_ranks)) if finite_ranks.size > 0 else 0.0
+
+        # MAR: sum of ranks, penalizing missing items with rank 101
+        mar_i = float(np.sum(np.where(np.isfinite(pos_ranks), pos_ranks, max_k + 1.0)))
+
+        recall_sum += recall_i
+        ndcg_sum += ndcg_i
+        mrr_sum += mrr_i
+        mar_sum += mar_i
+        n_effective += 1
+
+    if n_effective == 0:
+        return {
+            f"recall@{T}": 0.0,
+            "ndcg": 0.0,
+            "mrr": 0.0,
+            "mar": 0.0,
+        }
+
+    N = float(n_effective)
+    return {
+        f"recall@{T}": recall_sum / N,
+        "ndcg": ndcg_sum / N,
+        "mrr": mrr_sum / N,
+        "mar": mar_sum / N,
+    }
 
 
 @dataclass
@@ -608,8 +1037,11 @@ def make_time_bins(
             bin_size_seconds = DEFAULT_BIN_SIZE_SECONDS
 
         span = t_max - t_min
+        if bin_size_seconds is None:
+            bin_size_seconds = DEFAULT_BIN_SIZE_SECONDS
         n_bins = int(np.ceil(span / bin_size_seconds))
         n_bins = max(n_bins, 1)
+        bin_edges = t_min + bin_size_seconds * np.arange(n_bins + 1, dtype=np.int64)
 
     # +1 so that the last timestamp falls in the last bin
     bin_edges = np.linspace(
@@ -665,6 +1097,7 @@ def make_interactions(
         .sum()
         .reset_index()
     )
+    grouped[count_col] = (grouped[count_col] > 0).astype(np.float32)
 
     # Convert to torch tensors
     user_ids = torch.LongTensor(grouped[user_col].to_numpy(dtype=np.int64))
@@ -781,12 +1214,30 @@ if __name__ == "__main__":
     train_dpf(
         model,
         train_int,
-        num_epochs=500,
+        val_int=val_int,
+        num_epochs=10000,
         lr=1e-2,
         optimizer_name="adamw",
         verbose=True,
+        min_epochs_before_stop=1000,
     )
 
+    # Paper metrics (same as paper/code): Recall@50, NDCG, MRR, MAR
+    # k=5, T=50
     test_users_np = df_test_users[0].to_numpy(dtype=np.int64)
-    recall, ndcg = recall_ndcg_at_k(model, test_int, k=100, test_users=test_users_np)
-    print(f"Test Recall@50 = {recall:.4f}, NDCG@50 = {ndcg:.4f}")
+    paper_metrics = paper_ranking_metrics(
+        model,
+        train_int,
+        val_int,
+        test_int,
+        T=50,
+        test_users=test_users_np,
+    )
+    print(
+        f"Paper metrics -> Recall@50 = {paper_metrics['recall@50']:.4f}, "
+        # f"NDCG = {paper_metrics['ndcg']:.4f}, "
+        # f"MRR = {paper_metrics['mrr']:.4f}, "
+        # f"MAR = {paper_metrics['mar']:.4f}"
+    )
+    # TODO: Remove unused functions
+    # TODO: Get plots
