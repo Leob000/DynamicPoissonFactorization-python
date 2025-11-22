@@ -1436,6 +1436,140 @@ def concat_interactions(ints: Sequence[Interactions]) -> Interactions:
     )
 
 
+def choose_plot_entities(
+    num_users: int,
+    num_items: int,
+    train_int: Interactions,
+    n_users: int,
+    n_items: int,
+    choose_random: bool = True,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[list[int], list[int]]:
+    """
+    Pick which users/items to visualize, either randomly or by activity.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if choose_random:
+        user_pool = np.arange(num_users)
+        if user_pool.size == 0:
+            active_users: list[int] = []
+        else:
+            k_u = min(n_users, user_pool.size)
+            active_users = rng.choice(user_pool, size=k_u, replace=False).tolist()
+
+        item_pool = np.arange(num_items)
+        if item_pool.size == 0:
+            active_items: list[int] = []
+        else:
+            k_m = min(n_items, item_pool.size)
+            active_items = rng.choice(item_pool, size=k_m, replace=False).tolist()
+    else:
+        active_users = pick_most_active_user(train_int, top_n=n_users)
+        active_items = pick_most_active_item(train_int, top_n=n_items)
+
+    return active_users, active_items
+
+
+def generate_plots(
+    model: DynamicPoissonFactorization,
+    train_int: Interactions,
+    val_int: Interactions,
+    test_int: Interactions,
+    bin_edges: np.ndarray,
+    history: Dict[str, List[Optional[float]]],
+    assets_dir: str,
+    plot_n_users: int = 1,
+    plot_n_items: int = 1,
+    choose_random: bool = True,
+):
+    """
+    Orchestrate user/item/global plots and save them under assets_dir.
+    """
+    os.makedirs(assets_dir, exist_ok=True)
+    all_int = concat_interactions([train_int, val_int, test_int])
+
+    max_time_train = (
+        int(train_int.time_ids.max().item()) + 1
+        if train_int.time_ids.numel() > 0
+        else model.T
+    )
+
+    active_users, active_items = choose_plot_entities(
+        num_users=model.N,
+        num_items=model.M,
+        train_int=train_int,
+        n_users=plot_n_users,
+        n_items=plot_n_items,
+        choose_random=choose_random,
+    )
+
+    for u in active_users:
+        fig_user = plot_user_evolution(
+            model,
+            train_int=train_int,
+            all_int=all_int,
+            bin_edges=bin_edges,
+            user_id=u,
+            num_factors=5,
+            truncate_to_train=True,
+        )
+        fig_user.suptitle(f"User {u} – evolution", y=1.02)
+        user_fname = os.path.join(assets_dir, f"user_{u}_evolution.pdf")
+        fig_user.savefig(user_fname)
+        print(f"Saved user evolution plot to {user_fname}")
+        plt.close(fig_user)
+
+    for m in active_items:
+        fig_item = plot_item_evolution(
+            model,
+            train_int=train_int,
+            all_int=all_int,
+            bin_edges=bin_edges,
+            item_id=m,
+            num_factors=4,
+            truncate_to_train=True,
+        )
+        fig_item.suptitle(f"Item {m} – evolution", y=1.02)
+        item_fname = os.path.join(assets_dir, f"item_{m}_evolution.pdf")
+        fig_item.savefig(item_fname)
+        print(f"Saved item evolution plot to {item_fname}")
+        plt.close(fig_item)
+
+        fig_item_static = plot_item_static_factors(
+            model,
+            item_id=m,
+            top_k=5,
+        )
+        item_static_fname = os.path.join(assets_dir, f"item_{m}_static_factors.pdf")
+        fig_item_static.savefig(item_static_fname)
+        print(f"Saved item static factors plot to {item_static_fname}")
+        plt.close(fig_item_static)
+
+    fig_global = plot_global_factor_popularity(
+        model,
+        use_items=True,
+        normalize_per_time=True,
+        max_time=max_time_train,
+    )
+
+    global_fname = os.path.join(assets_dir, "global_factor_evolution.pdf")
+    fig_global.savefig(global_fname)
+    print(f"Saved global factor evolution plot to {global_fname}")
+
+    fig_train = plot_training_history(
+        history,
+        title="ELBO and validation predictive log-likelihood over epochs",
+    )
+    train_curve_fname = os.path.join(assets_dir, "training_elbo_val_pred_ll.pdf")
+    fig_train.savefig(train_curve_fname)
+    print(f"Saved training curve plot to {train_curve_fname}")
+    plt.close(fig_train)
+
+    plt.close("all")
+
+
 if __name__ == "__main__":
     dfs = {}
     for split in ["train", "validation", "test"]:
@@ -1453,12 +1587,6 @@ if __name__ == "__main__":
         dfs["validation"],
         dfs["test"],
     )
-
-    # all_int used for click frequencies, (so last bins include val/test clicks)
-    all_int = concat_interactions([train_int, val_int, test_int])
-
-    # global last training bin index (inclusive)
-    global_last_train_bin = int(train_int.time_ids.max().item())
 
     # Infer problem dimensions
     T = len(bin_edges) - 1  # number of time bins
@@ -1524,101 +1652,20 @@ if __name__ == "__main__":
         # f"MAR = {paper_metrics['mar']:.4f}"
     )
     assets_dir = os.path.join("assets")
-    os.makedirs(assets_dir, exist_ok=True)
 
     # --- Example: pick top-N active users + items
     PLOT_N_USERS = 1
     PLOT_N_ITEMS = 1
     PLOT_CHOOSE_RANDOM = True
-
-    if PLOT_CHOOSE_RANDOM:
-        # Pick random users/items
-        rng = np.random.default_rng()
-        user_pool = np.arange(num_users)
-        if user_pool.size == 0:
-            active_users = []
-        else:
-            k_u = min(PLOT_N_USERS, user_pool.size)
-            active_users = rng.choice(user_pool, size=k_u, replace=False).tolist()
-        item_pool = np.arange(num_items)
-        if item_pool.size == 0:
-            active_items = []
-        else:
-            k_m = min(PLOT_N_ITEMS, item_pool.size)
-            active_items = rng.choice(item_pool, size=k_m, replace=False).tolist()
-    else:
-        # Pick most active users/items from training set
-        active_users = pick_most_active_user(train_int, top_n=PLOT_N_USERS)
-        active_items = pick_most_active_item(train_int, top_n=PLOT_N_ITEMS)
-
-    # Build combined interactions for plotting clicks
-    all_int = concat_interactions([train_int, val_int, test_int])
-    max_time_train = int(train_int.time_ids.max().item()) + 1
-
-    # Generate and save user evolution plots for each of the top users
-    for u in active_users:
-        fig_user = plot_user_evolution(
-            model,
-            train_int=train_int,
-            all_int=all_int,
-            bin_edges=bin_edges,
-            user_id=u,
-            num_factors=5,
-            truncate_to_train=True,
-        )
-        fig_user.suptitle(f"User {u} – evolution", y=1.02)
-        user_fname = os.path.join(assets_dir, f"user_{u}_evolution.pdf")
-        fig_user.savefig(user_fname)
-        print(f"Saved user evolution plot to {user_fname}")
-        plt.close(fig_user)
-
-    # Generate and save item evolution + static factor plots for each of the top items
-    for m in active_items:
-        fig_item = plot_item_evolution(
-            model,
-            train_int=train_int,
-            all_int=all_int,
-            bin_edges=bin_edges,
-            item_id=m,
-            num_factors=4,
-            truncate_to_train=True,
-        )
-        fig_item.suptitle(f"Item {m} – evolution", y=1.02)
-        item_fname = os.path.join(assets_dir, f"item_{m}_evolution.pdf")
-        fig_item.savefig(item_fname)
-        print(f"Saved item evolution plot to {item_fname}")
-        plt.close(fig_item)
-
-        fig_item_static = plot_item_static_factors(
-            model,
-            item_id=m,
-            top_k=5,
-        )
-        item_static_fname = os.path.join(assets_dir, f"item_{m}_static_factors.pdf")
-        fig_item_static.savefig(item_static_fname)
-        print(f"Saved item static factors plot to {item_static_fname}")
-        plt.close(fig_item_static)
-
-    # --- Global factor evolution ( Figure 3)
-    fig_global = plot_global_factor_popularity(
+    generate_plots(
         model,
-        use_items=True,
-        normalize_per_time=True,
-        max_time=max_time_train,
+        train_int=train_int,
+        val_int=val_int,
+        test_int=test_int,
+        bin_edges=bin_edges,
+        history=history,
+        assets_dir=assets_dir,
+        plot_n_users=PLOT_N_USERS,
+        plot_n_items=PLOT_N_ITEMS,
+        choose_random=PLOT_CHOOSE_RANDOM,
     )
-
-    global_fname = os.path.join(assets_dir, "global_factor_evolution.pdf")
-    fig_global.savefig(global_fname)
-    print(f"Saved global factor evolution plot to {global_fname}")
-
-    # --- Training curve: ELBO & validation predictive LL over epochs
-    fig_train = plot_training_history(
-        history,
-        title="ELBO and validation predictive log-likelihood over epochs",
-    )
-    train_curve_fname = os.path.join(assets_dir, "training_elbo_val_pred_ll.pdf")
-    fig_train.savefig(train_curve_fname)
-    print(f"Saved training curve plot to {train_curve_fname}")
-    plt.close(fig_train)
-
-    plt.close("all")
