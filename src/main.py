@@ -1,10 +1,12 @@
 from __future__ import annotations
-from collections import defaultdict
 
 import math
+import os
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -265,33 +267,6 @@ class DynamicPoissonFactorization(nn.Module):
         log_lik = y_log_term - total_rate
         return log_lik
 
-    def responsibilities_phi(
-        self,
-        interactions: Interactions,
-    ) -> torch.Tensor:
-        """
-        Compute phi_{nmtk} prop= exp(E[log theta_{nkt}] + E[log beta_{mkt}])
-        for the provided interactions. Returns a tensor of shape (nnz, K).
-        """
-        user_ids = interactions.user_ids.to(self.device).long()
-        item_ids = interactions.item_ids.to(self.device).long()
-        time_ids = interactions.time_ids.to(self.device).long()
-
-        log_theta = self.expected_log_user_factors(
-            user_ids,  # type:ignore
-            time_ids,  # type:ignore
-        )  # (nnz, K)
-        log_beta = self.expected_log_item_factors(
-            item_ids,  # type:ignore
-            time_ids,  # type:ignore
-        )  # (nnz, K)
-        logits = log_theta + log_beta  # (nnz, K)
-
-        # Softmax gives normalized phi, but we typically don't let grads
-        # flow through phi when thinking in coordinate-ascent terms.
-        phi = torch.softmax(logits.detach(), dim=-1)
-        return phi
-
     def gaussian_prior_log_prob(self) -> torch.Tensor:
         """
         E_q[log p(Z)] where:
@@ -443,19 +418,22 @@ def train_dpf(
     report_every: int = 10,
     min_epochs_before_stop: int = 30,
     verbose: bool = True,
-) -> None:
+) -> Dict[str, List[Optional[float]]]:
     """
     Full-batch training loop on 'train_int' with optional validation-based early stopping
     (mirrors the C++ schedule: report every 10 iters, stop on flat/decreasing val pred LL).
 
     - optimizer_name: "adamw" or "lbfgs"
     - full dataset is used per step (possible to add mini-batching?).
-    - if val_int is provided, predictive LL is computed every report_every steps and
-      stopping triggers after min_epochs_before_stop once the metric stagnates/degrades.
+    - if val_int is provided, predictive LL is computed every epoch and stored,
+      and early stopping uses values at reporting steps (every 'report_every' epochs).
+    Returns a history dict with keys:
+        - "epoch"        : epoch indices
+        - "elbo"         : train ELBO values
+        - "val_pred_ll"  : validation predictive log-likelihood (or None if val_int is None)
     """
     model.train()
     params = list(model.parameters())
-
     device = model.device
 
     # Per-user last train time for clamping validation/test (mirrors C++ usage).
@@ -482,6 +460,13 @@ def train_dpf(
         ll = (y * torch.log(lam) - lam - torch.lgamma(y + 1.0)).sum()
         return float(ll.detach().cpu().item())
 
+    # history containers
+    history: Dict[str, List[Optional[float]]] = {
+        "epoch": [],
+        "elbo": [],
+        "val_pred_ll": [],
+    }
+
     prev_val_ll: Optional[float] = None
     nh = 0  # number of consecutive decreases
     stop = False
@@ -497,13 +482,24 @@ def train_dpf(
             loss.backward()
             optimizer.step()
 
+            # --- compute validation predictive LL for this epoch (if any) ---
+            if val_int is not None:
+                val_ll = predictive_log_likelihood(val_int)
+            else:
+                val_ll = None
+
+            # --- log history ---
+            history["epoch"].append(float(epoch))
+            history["elbo"].append(float(elbo.item()))
+            history["val_pred_ll"].append(val_ll)
+
+            # --- reporting / early stopping (same schedule as before) ---
             should_report = verbose and (
                 epoch % report_every == 0 or epoch == num_epochs - 1
             )
             if should_report:
                 msg = f"[AdamW] epoch={epoch:04d}  ELBO={elbo.item():.3e}"
-                if val_int is not None and epoch % report_every == 0:
-                    val_ll = predictive_log_likelihood(val_int)
+                if val_ll is not None:
                     msg += f"  val_pred_ll={val_ll:.3e}"
                     if epoch >= min_epochs_before_stop:
                         if prev_val_ll is not None:
@@ -521,6 +517,7 @@ def train_dpf(
                                 stop = True
                         prev_val_ll = val_ll
                 print(msg)
+
             if stop:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
@@ -546,15 +543,30 @@ def train_dpf(
 
             loss = optimizer.step(closure)
 
+            # Recompute ELBO for logging
+            with torch.no_grad():
+                elbo = model.elbo(train_int)
+
+            # Validation predictive LL for this epoch (if any)
+            if val_int is not None:
+                val_ll = predictive_log_likelihood(val_int)
+            else:
+                val_ll = None
+
+            # Log history
+            history["epoch"].append(float(epoch))
+            history["elbo"].append(float(elbo.item()))
+            history["val_pred_ll"].append(val_ll)
+
             should_report = verbose and (
                 epoch % report_every == 0 or epoch == num_epochs - 1
             )
             if should_report:
-                with torch.no_grad():
-                    elbo = model.elbo(train_int)
-                msg = f"[LBFGS] epoch={epoch:04d}  loss={loss.item():.3e}  ELBO={elbo.item():.3e}"
-                if val_int is not None and epoch % report_every == 0:
-                    val_ll = predictive_log_likelihood(val_int)
+                msg = (
+                    f"[LBFGS] epoch={epoch:04d}  loss={loss.item():.3e}  "
+                    f"ELBO={elbo.item():.3e}"
+                )
+                if val_ll is not None:
                     msg += f"  val_pred_ll={val_ll:.3e}"
                     if epoch >= min_epochs_before_stop:
                         if prev_val_ll is not None:
@@ -572,12 +584,15 @@ def train_dpf(
                                 stop = True
                         prev_val_ll = val_ll
                 print(msg)
+
             if stop:
                 if verbose:
                     print(f"Early stopping at epoch {epoch}")
                 break
     else:
         raise ValueError(f"Unknown optimizer_name={optimizer_name}")
+
+    return history
 
 
 def build_user_time_positives(
@@ -634,190 +649,6 @@ def scores_for_user_time(
         lam = model.poisson_rate(user_ids, item_ids, time_ids)  # type:ignore
 
     return lam.cpu()
-
-
-def recall_ndcg_at_k(
-    model: DynamicPoissonFactorization,
-    test_int: Interactions,
-    k: int = 50,
-    test_users: Optional[np.ndarray] = None,
-) -> tuple[float, float]:
-    """
-    Evaluate Recall@k and NDCG@k over all (user, time_bin) pairs
-    that have at least one positive item.
-
-    Here:
-      - k is the top-T cutoff over items (T in the paper).
-      - The number of latent factors is model.K (unrelated).
-
-    If test_users is provided (1D np.array of user IDs), restrict to those users.
-    """
-    import numpy as np
-
-    ut_pos = build_user_time_positives(test_int)
-
-    recalls = []
-    ndcgs = []
-
-    for (u, t), pos_items in ut_pos.items():
-        if test_users is not None and u not in test_users:
-            continue
-        if not pos_items:
-            continue
-
-        scores = scores_for_user_time(model, u, t)
-        topk = torch.topk(scores, k).indices.numpy().tolist()
-
-        hits = [1.0 if item in pos_items else 0.0 for item in topk]
-        num_pos = len(pos_items)
-
-        # --- Recall@k: paper uses denominator min(k, |y_i|)
-        recall = sum(hits) / float(min(k, num_pos))
-        recalls.append(recall)
-
-        # --- NDCG@k: standard normalized truncated NDCG (this is NOT exactly
-        # the paper's NDCG, which is unnormalized and not truncated, but it's
-        # a perfectly reasonable top-k metric to keep).
-        dcg = sum(h / math.log2(i + 2) for i, h in enumerate(hits))
-        ideal_hits = [1.0] * min(num_pos, k)
-        idcg = sum(h / math.log2(i + 2) for i, h in enumerate(ideal_hits))
-        ndcg = dcg / idcg if idcg > 0 else 0.0
-        ndcgs.append(ndcg)
-
-    if not recalls:
-        return 0.0, 0.0
-
-    return float(np.mean(recalls)), float(np.mean(ndcgs))
-
-
-def precision_ndcg_at_ks(
-    model: DynamicPoissonFactorization,
-    train_int: Interactions,
-    val_int: Interactions,
-    test_int: Interactions,
-    ks: tuple[int, ...] = (10, 100),
-    test_users: Optional[np.ndarray] = None,
-) -> dict[int, tuple[float, float]]:
-    """
-    Mimic the C++ compute_precision:
-      - rank items at each user's last train timestep
-      - exclude any item appearing in train or validation (any time)
-      - relevance from test counts at time >= last-train timestep (graded)
-      - report precision@k and ndcg@k for requested ks
-    Returns {k: (precision_at_k, ndcg_at_k)}.
-    """
-    import numpy as np
-
-    device = model.device
-    max_k = max(ks)
-
-    # Last train timestep per user
-    last_t = last_training_timestep(train_int, model.N)
-
-    # Items seen in train/validation per user (exclude from ranking)
-    def gather_seen(intx: Interactions) -> dict[int, set[int]]:
-        seen: dict[int, set[int]] = defaultdict(set)
-        if intx.user_ids.numel() == 0:
-            return seen
-        for u, m in zip(intx.user_ids.cpu().numpy(), intx.item_ids.cpu().numpy()):
-            seen[int(u)].add(int(m))
-        return seen
-
-    train_seen = gather_seen(train_int)
-    val_seen = gather_seen(val_int)
-
-    # Test entries per user (item, time, count)
-    test_by_user: dict[int, list[tuple[int, int, float]]] = defaultdict(list)
-    for u, m, t, c in zip(
-        test_int.user_ids.cpu().numpy(),
-        test_int.item_ids.cpu().numpy(),
-        test_int.time_ids.cpu().numpy(),
-        test_int.counts.cpu().numpy(),
-    ):
-        test_by_user[int(u)].append((int(m), int(t), float(c)))
-
-    users_to_eval: Iterable[int]
-    if test_users is not None:
-        users_to_eval = [int(u) for u in test_users.tolist()]
-    else:
-        users_to_eval = list(test_by_user.keys())
-
-    precisions = {k: [] for k in ks}
-    ndcgs = {k: [] for k in ks}
-
-    # Safe gain to avoid overflow in (2^g - 1)
-    ln2 = math.log(2.0)
-
-    def _gain(x: float) -> float:
-        if x <= 0:
-            return 0.0
-        return math.expm1(min(x * ln2, 700.0))  # clamp exponent to avoid inf
-
-    for u in users_to_eval:
-        if u >= model.N:
-            continue
-        t_last = int(last_t[u])
-        # Determine relevance: first test event at or after t_last
-        rel: dict[int, float] = {}
-        rel_time: dict[int, int] = {}
-        for m, t, c in test_by_user.get(u, []):
-            if t < t_last:
-                continue
-            if m not in rel_time or t < rel_time[m]:
-                rel_time[m] = t
-                rel[m] = c
-
-        # No relevant items => skip (matches C++ behavior of user_has_test_ratings)
-        if not rel:
-            continue
-
-        # Score all items at t_last
-        M = model.M
-        user_ids = torch.full((M,), u, dtype=torch.long, device=device)
-        item_ids = torch.arange(M, dtype=torch.long, device=device)
-        time_ids = torch.full(
-            (M,), min(t_last, model.T - 1), dtype=torch.long, device=device
-        )
-
-        with torch.no_grad():
-            scores = model.poisson_rate(user_ids, item_ids, time_ids)  # type:ignore
-
-        # Mask out train/val items
-        seen_items = train_seen.get(u, set()) | val_seen.get(u, set())
-        if seen_items:
-            mask = torch.full_like(scores, False, dtype=torch.bool)
-            if len(seen_items) > 0:
-                idx = torch.tensor(list(seen_items), dtype=torch.long, device=device)
-                mask[idx] = True
-            scores = scores.masked_fill(mask, -float("inf"))
-
-        # Top-k
-        topk = torch.topk(scores, max_k).indices.cpu().numpy().tolist()
-
-        # Build gains for sorted predictions
-        gains = [rel.get(m, 0.0) for m in topk]
-
-        # Ideal gains (sorted by relevance)
-        ideal = sorted(rel.values(), reverse=True)
-
-        for k in ks:
-            pred_k = gains[:k]
-            hits = sum(1.0 for g in pred_k if g > 0)
-            precisions[k].append(hits / k)
-
-            ideal_k = ideal[:k]
-            if ideal_k and ideal_k[0] > 0:
-                dcg = sum(_gain(g) / math.log2(i + 2) for i, g in enumerate(pred_k))
-                idcg = sum(_gain(g) / math.log2(i + 2) for i, g in enumerate(ideal_k))
-                ndcgs[k].append(dcg / idcg if idcg > 0 else 0.0)
-
-    return {
-        k: (
-            float(np.mean(precisions[k])) if precisions[k] else 0.0,
-            float(np.mean(ndcgs[k])) if ndcgs[k] else 0.0,
-        )
-        for k in ks
-    }
 
 
 def paper_ranking_metrics(
@@ -1145,17 +976,464 @@ def prepare_splits_with_time_bins(
     return train_int, val_int, test_int, bin_edges
 
 
-def filter_to_users(
-    df: pd.DataFrame,
-    df_users: pd.DataFrame,
-    user_col: int = 0,
-) -> pd.DataFrame:
+# --- Plotting utilities
+
+
+def plot_training_history(
+    history: Dict[str, List[Optional[float]]],
+    title: str = "Training curve",
+):
     """
-    Keep only rows whose user is in df_users[user_col].
+    Plot train ELBO and validation predictive log-likelihood over epochs.
+
+    history should be the dict returned by train_dpf.
     """
-    keep_users = df_users[user_col].to_numpy()
-    mask = df[user_col].isin(keep_users)
-    return df.loc[mask].reset_index(drop=True)
+    epochs = np.array(history["epoch"], dtype=float)
+    elbo = np.array(history["elbo"], dtype=float)
+
+    # Filter out epochs where val_pred_ll is None
+    val_ll_list = history.get("val_pred_ll", [])
+
+    val_epochs = []
+    val_vals = []
+    for e, v in zip(epochs, val_ll_list):
+        if v is not None:
+            val_epochs.append(e)
+            val_vals.append(v)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+
+    elbo = -elbo
+    val_vals = -np.array(val_vals, dtype=float)
+    ax.plot(epochs, elbo, label="Train ELBO * (-1)")
+    if len(val_epochs) > 0:
+        ax.plot(
+            np.array(val_epochs, dtype=float),
+            np.array(val_vals, dtype=float),
+            label="Validation predictive NLL",
+        )
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Objective")
+    ax.set_title(title)
+    ax.legend(loc="best")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    return fig
+
+
+def _bin_centers_from_edges(bin_edges: np.ndarray) -> np.ndarray:
+    """
+    Convert bin edges (length T+1) to bin centers (length T) in Unix seconds.
+    """
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    return edges[:-1] + 0.5 * np.diff(edges)
+
+
+def _to_datetimes(bin_centers: np.ndarray) -> pd.DatetimeIndex:
+    """
+    Convert Unix seconds (float) to pandas datetimes.
+    """
+    return pd.to_datetime(bin_centers, unit="s")
+
+
+def pick_most_active_user(interactions: Interactions, top_n: int = 1) -> list[int]:
+    """
+    Heuristic: return IDs of users with most clicks in 'interactions'.
+    """
+    u = interactions.user_ids.cpu().numpy()
+    c = interactions.counts.cpu().numpy()
+    max_user = int(u.max()) if u.size > 0 else -1
+    if max_user < 0:
+        return []
+
+    clicks_per_user = np.bincount(u, weights=c, minlength=max_user + 1)
+    order = np.argsort(-clicks_per_user)
+    return [int(uid) for uid in order[:top_n]]
+
+
+def pick_most_active_item(interactions: Interactions, top_n: int = 1) -> list[int]:
+    """
+    Heuristic: return IDs of items with most clicks in 'interactions'.
+    """
+    m = interactions.item_ids.cpu().numpy()
+    c = interactions.counts.cpu().numpy()
+    max_item = int(m.max()) if m.size > 0 else -1
+    if max_item < 0:
+        return []
+
+    clicks_per_item = np.bincount(m, weights=c, minlength=max_item + 1)
+    order = np.argsort(-clicks_per_item)
+    return [int(i) for i in order[:top_n]]
+
+
+def user_factor_trajectory(
+    model: DynamicPoissonFactorization,
+    user_id: int,
+) -> np.ndarray:
+    """
+    Returns a (T, K) array with factor 'expression' for a given user
+    at all time bins.
+
+    Here we use E[theta_{nkt}] = E[exp(ubar_{nk} + u_{nkt})],
+    i.e. model.expected_user_factors(...) for all t.
+    """
+    device = model.device
+    T, _ = model.T, model.K
+
+    user_ids = torch.full((T,), user_id, dtype=torch.long, device=device)
+    time_ids = torch.arange(T, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        theta = model.expected_user_factors(user_ids, time_ids)  # (T, K) #type:ignore
+
+    return theta.cpu().numpy()  # shape (T, K)
+
+
+def item_factor_trajectory(
+    model: DynamicPoissonFactorization,
+    item_id: int,
+) -> np.ndarray:
+    """
+    Returns a (T, K) array with factor 'expression' for a given item
+    at all time bins:
+
+      beta_{mkt} = E[exp(vbar_{mk} + v_{mkt})].
+    """
+    device = model.device
+    T, _ = model.T, model.K
+
+    item_ids = torch.full((T,), item_id, dtype=torch.long, device=device)
+    time_ids = torch.arange(T, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        beta = model.expected_item_factors(item_ids, time_ids)  # (T, K) #type:ignore
+
+    return beta.cpu().numpy()  # shape (T, K)
+
+
+def plot_user_evolution(
+    model: DynamicPoissonFactorization,
+    train_int: Interactions,
+    all_int: Interactions,
+    bin_edges: np.ndarray,
+    user_id: int,
+    num_factors: int = 4,
+    factor_labels: Optional[Dict[int, str]] = None,
+    truncate_to_train: bool = True,
+):
+    """
+    Figure-1–style plot for a single user.
+
+    - Top: total clicks per time bin (train + val + test).
+    - Bottom: factor expressions over time (E[theta_{nkt}]).
+
+    If truncate_to_train=True, we only show bins up to the last
+    *training* time bin (globally). This avoids plotting unconstrained
+    factors in bins where the model never saw data.
+    """
+    T = model.T
+    assert T == len(bin_edges) - 1, "T must match bin_edges"
+
+    # --- Time axis (bin centers -> datetimes) ---
+    centers = _bin_centers_from_edges(bin_edges)
+    dates = _to_datetimes(centers)
+
+    # --- Click series for this user, using ALL splits ---
+    def _user_click_series_all(
+        ints: Sequence[Interactions],
+        user_id: int,
+        T: int,
+    ) -> np.ndarray:
+        clicks = np.zeros(T, dtype=np.float64)
+        for inter in ints:
+            u = inter.user_ids.cpu().numpy()
+            t = inter.time_ids.cpu().numpy()
+            c = inter.counts.cpu().numpy()
+            mask = u == user_id
+            for ti, ci in zip(t[mask], c[mask]):
+                clicks[int(ti)] += float(ci)
+        return clicks
+
+    clicks_t_full = _user_click_series_all(
+        [
+            train_int,
+            all_int,
+        ],  # 'all_int' already contains val+test; including train again is harmless
+        user_id,
+        T,
+    )
+
+    # --- Factor trajectories over all time bins
+    theta_full = user_factor_trajectory(model, user_id)  # (T, K)
+
+    # --- Truncate to training horizon, if requested
+    if truncate_to_train and train_int.time_ids.numel() > 0:
+        global_last_train_bin = int(train_int.time_ids.max().item())
+        t_max = min(global_last_train_bin, T - 1)
+    else:
+        t_max = T - 1
+
+    sl = slice(0, t_max + 1)
+
+    clicks_t = clicks_t_full[sl]
+    theta = theta_full[sl, :]
+    dates = dates[sl]
+
+    # --- Choose most-expressed factors for this user
+    mean_per_factor = theta.mean(axis=0)
+    order = np.argsort(-mean_per_factor)
+    chosen_factors = order[:num_factors]
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, figsize=(10, 6), sharex=True, constrained_layout=True
+    )
+
+    # --- Top: clicks
+    ax_top.plot(dates, clicks_t, marker="o")
+    ax_top.set_ylabel("Click frequency")
+    ax_top.set_title(f"User {user_id} – clicks and factor expression over time")
+
+    # --- Bottom: factors
+    for k in chosen_factors:
+        label = factor_labels.get(k, f"Factor {k}") if factor_labels else f"Factor {k}"
+        ax_bottom.plot(dates, theta[:, k], label=label)
+
+    ax_bottom.set_ylabel("Factor expression (E[theta_{nkt}])")
+    ax_bottom.set_xlabel("Time")
+    ax_bottom.legend(loc="upper left", frameon=False)
+
+    return fig
+
+
+def plot_item_evolution(
+    model: DynamicPoissonFactorization,
+    train_int: Interactions,
+    all_int: Interactions,
+    bin_edges: np.ndarray,
+    item_id: int,
+    num_factors: int = 4,
+    factor_labels: Optional[Dict[int, str]] = None,
+    truncate_to_train: bool = True,
+):
+    """
+    Figure-1–style plot for a single item.
+
+    - Top: total accesses per time bin (train + val + test).
+    - Bottom: factor expressions over time (E[beta_{mkt}]).
+
+    If truncate_to_train=True, only show bins up to the last
+    training time bin globally.
+    """
+    T = model.T
+    assert T == len(bin_edges) - 1, "T must match bin_edges"
+
+    centers = _bin_centers_from_edges(bin_edges)
+    dates = _to_datetimes(centers)
+
+    # --- Access series for this item across all splits
+    def _item_click_series_all(
+        ints: Sequence[Interactions],
+        item_id: int,
+        T: int,
+    ) -> np.ndarray:
+        clicks = np.zeros(T, dtype=np.float64)
+        for inter in ints:
+            m = inter.item_ids.cpu().numpy()
+            t = inter.time_ids.cpu().numpy()
+            c = inter.counts.cpu().numpy()
+            mask = m == item_id
+            for ti, ci in zip(t[mask], c[mask]):
+                clicks[int(ti)] += float(ci)
+        return clicks
+
+    clicks_t_full = _item_click_series_all(
+        [train_int, all_int],
+        item_id,
+        T,
+    )
+
+    beta_full = item_factor_trajectory(model, item_id)  # (T, K)
+
+    if truncate_to_train and train_int.time_ids.numel() > 0:
+        global_last_train_bin = int(train_int.time_ids.max().item())
+        t_max = min(global_last_train_bin, T - 1)
+    else:
+        t_max = T - 1
+
+    sl = slice(0, t_max + 1)
+
+    clicks_t = clicks_t_full[sl]
+    beta = beta_full[sl, :]
+    dates = dates[sl]
+
+    mean_per_factor = beta.mean(axis=0)
+    order = np.argsort(-mean_per_factor)
+    chosen_factors = order[:num_factors]
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, figsize=(10, 6), sharex=True, constrained_layout=True
+    )
+
+    ax_top.plot(dates, clicks_t, marker="o")
+    ax_top.set_ylabel("Access frequency")
+    ax_top.set_title(f"Item {item_id} – accesses and factor expression over time")
+
+    for k in chosen_factors:
+        label = factor_labels.get(k, f"Factor {k}") if factor_labels else f"Factor {k}"
+        ax_bottom.plot(dates, beta[:, k], label=label)
+
+    ax_bottom.set_ylabel("Factor expression (E[beta_{mkt}])")
+    ax_bottom.set_xlabel("Time")
+    ax_bottom.legend(loc="upper left", frameon=False)
+
+    return fig
+
+
+def plot_global_factor_popularity(
+    model: DynamicPoissonFactorization,
+    use_items: bool = True,
+    normalize_per_time: bool = True,
+    factor_labels: Optional[Dict[int, str]] = None,
+    max_time: Optional[int] = None,
+):
+    """
+    Figure-3–style plot: evolution of factors over time.
+
+    max_time: if not None, only use time bins [0, max_time) for the plot.
+              A good choice is max_time = last training time bin + 1.
+    """
+    T, K = model.T, model.K
+
+    if max_time is None:
+        Tmax = T
+    else:
+        Tmax = min(max_time, T)
+
+    with torch.no_grad():
+        if use_items:
+            mu_dyn = model.mu_v[:, :, :Tmax]  # (M, K, Tmax)
+            mu_static = model.mu_v_bar[:, :, None]  # (M, K, 1)
+            var_dyn = torch.exp(model.logvar_v[:, :, :Tmax])
+            var_static = torch.exp(model.logvar_v_bar)[:, :, None]
+
+            mu_total = mu_dyn + mu_static
+            var_total = var_dyn + var_static
+
+            beta = torch.exp(mu_total + 0.5 * var_total)  # (M, K, Tmax)
+            f_k_t = beta.sum(dim=0)  # (K, Tmax)
+        else:
+            mu_dyn = model.mu_u[:, :, :Tmax]
+            mu_static = model.mu_u_bar[:, :, None]
+            var_dyn = torch.exp(model.logvar_u[:, :, :Tmax])
+            var_static = torch.exp(model.logvar_u_bar)[:, :, None]
+
+            mu_total = mu_dyn + mu_static
+            var_total = var_dyn + var_static
+
+            theta = torch.exp(mu_total + 0.5 * var_total)  # (N, K, Tmax)
+            f_k_t = theta.sum(dim=0)  # (K, Tmax)
+
+    f_t_k = f_k_t.transpose(0, 1).cpu().numpy()  # (Tmax, K)
+
+    if normalize_per_time:
+        denom = f_t_k.sum(axis=1, keepdims=True)
+        denom[denom == 0.0] = 1.0
+        f_t_k = f_t_k / denom
+
+    xs = np.arange(Tmax)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for k in range(K):
+        label = factor_labels.get(k, f"Factor {k}") if factor_labels else f"Factor {k}"
+        ax.plot(xs, f_t_k[:, k], label=label)
+
+    ax.set_xlabel("Time bin index")
+    ax.set_ylabel(
+        "Relative popularity (per time)"
+        if normalize_per_time
+        else "Total factor intensity"
+    )
+    side = "items" if use_items else "users"
+    ax.set_title(f"Global factor evolution over time ({side})")
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        fontsize="small",
+    )
+    fig.tight_layout()
+
+    return fig
+
+
+def plot_item_static_factors(
+    model: DynamicPoissonFactorization,
+    item_id: int,
+    top_k: Optional[int] = None,
+    factor_labels: Optional[Dict[int, str]] = None,
+):
+    """
+    Figure-4–style plot: static factors for a single item.
+
+    We use the static log-factors v_bar[m, k] and their variance:
+
+        E[beta_bar_{mk}] = E[exp(v_bar_{mk})]
+                         = exp(mu + 0.5 * var)
+
+    This is time-independent; we show it as a bar chart.
+    """
+    with torch.no_grad():
+        mu = model.mu_v_bar[item_id, :]  # (K,)
+        var = torch.exp(model.logvar_v_bar[item_id, :])  # (K,)
+        beta_bar = torch.exp(mu + 0.5 * var).cpu().numpy()  # (K,)
+
+    K = model.K
+    idx = np.arange(K)
+
+    if top_k is not None and top_k < K:
+        order = np.argsort(-beta_bar)[:top_k]
+        idx = order
+        vals = beta_bar[order]
+        labels = [
+            factor_labels.get(k, f"Factor {k}") if factor_labels else f"F{k}"
+            for k in order
+        ]
+    else:
+        vals = beta_bar
+        labels = [
+            factor_labels.get(k, f"Factor {k}") if factor_labels else f"F{k}"
+            for k in range(K)
+        ]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(np.arange(len(idx)), vals, tick_label=labels)
+    ax.set_ylabel("Static factor expression (E[betā_{mk}])")
+    ax.set_title(f"Static factors for item {item_id}")
+    plt.xticks(rotation=45, ha="right")
+
+    fig.tight_layout()
+    return fig
+
+
+def concat_interactions(ints: Sequence[Interactions]) -> Interactions:
+    """
+    Concatenate multiple Interactions objects.
+    Assumes splits are disjoint in time (true for your dataset).
+    """
+    user_ids = torch.cat([x.user_ids for x in ints])
+    item_ids = torch.cat([x.item_ids for x in ints])
+    time_ids = torch.cat([x.time_ids for x in ints])
+    counts = torch.cat([x.counts for x in ints])
+
+    return Interactions(
+        user_ids=user_ids,  # type:ignore
+        item_ids=item_ids,  # type:ignore
+        time_ids=time_ids,  # type:ignore
+        counts=counts,  # type:ignore
+    )
 
 
 if __name__ == "__main__":
@@ -1175,6 +1453,12 @@ if __name__ == "__main__":
         dfs["validation"],
         dfs["test"],
     )
+
+    # all_int used for click frequencies, (so last bins include val/test clicks)
+    all_int = concat_interactions([train_int, val_int, test_int])
+
+    # global last training bin index (inclusive)
+    global_last_train_bin = int(train_int.time_ids.max().item())
 
     # Infer problem dimensions
     T = len(bin_edges) - 1  # number of time bins
@@ -1210,8 +1494,8 @@ if __name__ == "__main__":
     print("device:", device)
     print(model)
 
-    # Train model (example: small number of epochs to test everything works)
-    train_dpf(
+    # Train model
+    history = train_dpf(
         model,
         train_int,
         val_int=val_int,
@@ -1239,5 +1523,102 @@ if __name__ == "__main__":
         # f"MRR = {paper_metrics['mrr']:.4f}, "
         # f"MAR = {paper_metrics['mar']:.4f}"
     )
-    # TODO: Remove unused functions
-    # TODO: Get plots
+    assets_dir = os.path.join("assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    # --- Example: pick top-N active users + items
+    PLOT_N_USERS = 1
+    PLOT_N_ITEMS = 1
+    PLOT_CHOOSE_RANDOM = True
+
+    if PLOT_CHOOSE_RANDOM:
+        # Pick random users/items
+        rng = np.random.default_rng()
+        user_pool = np.arange(num_users)
+        if user_pool.size == 0:
+            active_users = []
+        else:
+            k_u = min(PLOT_N_USERS, user_pool.size)
+            active_users = rng.choice(user_pool, size=k_u, replace=False).tolist()
+        item_pool = np.arange(num_items)
+        if item_pool.size == 0:
+            active_items = []
+        else:
+            k_m = min(PLOT_N_ITEMS, item_pool.size)
+            active_items = rng.choice(item_pool, size=k_m, replace=False).tolist()
+    else:
+        # Pick most active users/items from training set
+        active_users = pick_most_active_user(train_int, top_n=PLOT_N_USERS)
+        active_items = pick_most_active_item(train_int, top_n=PLOT_N_ITEMS)
+
+    # Build combined interactions for plotting clicks
+    all_int = concat_interactions([train_int, val_int, test_int])
+    max_time_train = int(train_int.time_ids.max().item()) + 1
+
+    # Generate and save user evolution plots for each of the top users
+    for u in active_users:
+        fig_user = plot_user_evolution(
+            model,
+            train_int=train_int,
+            all_int=all_int,
+            bin_edges=bin_edges,
+            user_id=u,
+            num_factors=5,
+            truncate_to_train=True,
+        )
+        fig_user.suptitle(f"User {u} – evolution", y=1.02)
+        user_fname = os.path.join(assets_dir, f"user_{u}_evolution.pdf")
+        fig_user.savefig(user_fname)
+        print(f"Saved user evolution plot to {user_fname}")
+        plt.close(fig_user)
+
+    # Generate and save item evolution + static factor plots for each of the top items
+    for m in active_items:
+        fig_item = plot_item_evolution(
+            model,
+            train_int=train_int,
+            all_int=all_int,
+            bin_edges=bin_edges,
+            item_id=m,
+            num_factors=4,
+            truncate_to_train=True,
+        )
+        fig_item.suptitle(f"Item {m} – evolution", y=1.02)
+        item_fname = os.path.join(assets_dir, f"item_{m}_evolution.pdf")
+        fig_item.savefig(item_fname)
+        print(f"Saved item evolution plot to {item_fname}")
+        plt.close(fig_item)
+
+        fig_item_static = plot_item_static_factors(
+            model,
+            item_id=m,
+            top_k=5,
+        )
+        item_static_fname = os.path.join(assets_dir, f"item_{m}_static_factors.pdf")
+        fig_item_static.savefig(item_static_fname)
+        print(f"Saved item static factors plot to {item_static_fname}")
+        plt.close(fig_item_static)
+
+    # --- Global factor evolution ( Figure 3)
+    fig_global = plot_global_factor_popularity(
+        model,
+        use_items=True,
+        normalize_per_time=True,
+        max_time=max_time_train,
+    )
+
+    global_fname = os.path.join(assets_dir, "global_factor_evolution.pdf")
+    fig_global.savefig(global_fname)
+    print(f"Saved global factor evolution plot to {global_fname}")
+
+    # --- Training curve: ELBO & validation predictive LL over epochs
+    fig_train = plot_training_history(
+        history,
+        title="ELBO and validation predictive log-likelihood over epochs",
+    )
+    train_curve_fname = os.path.join(assets_dir, "training_elbo_val_pred_ll.pdf")
+    fig_train.savefig(train_curve_fname)
+    print(f"Saved training curve plot to {train_curve_fname}")
+    plt.close(fig_train)
+
+    plt.close("all")
